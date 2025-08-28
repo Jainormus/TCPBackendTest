@@ -3,6 +3,7 @@ import openai
 from supabase import create_client, Client
 import numpy as np
 from typing import List, Dict, Any
+from .langchain_memory import LangChainMemoryService
 
 class RAGService:
     def __init__(self):
@@ -11,6 +12,7 @@ class RAGService:
             os.getenv("SUPABASE_URL"),
             os.getenv("SUPABASE_KEY")
         )
+        self.memory_service = LangChainMemoryService()
         
     async def get_embedding(self, text: str) -> List[float]:
         """Generate embedding for the given text using OpenAI"""
@@ -43,9 +45,16 @@ class RAGService:
             result = self.supabase.table('storage').select('*').limit(limit).execute()
             return result.data if result.data else []
     
-    async def get_rag_response(self, user_message: str, max_tokens: int = 500) -> Dict[str, Any]:
-        """Generate RAG response using OpenAI and Supabase"""
+    async def get_rag_response(self, user_message: str, session_id: str = None, max_tokens: int = 500) -> Dict[str, Any]:
+        """Generate RAG response using OpenAI and Supabase with LangChain memory"""
         try:
+            # Create session if not provided
+            if not session_id:
+                session_id = self.memory_service.create_session_id()
+            
+            # Add user message to LangChain memory
+            await self.memory_service.add_user_message(session_id, user_message)
+            
             # Generate embedding for user query
             query_embedding = await self.get_embedding(user_message)
             
@@ -63,6 +72,9 @@ class RAGService:
                         'id': doc.get('id'),
                         'metadata': doc.get('metadata', {})
                     })
+            
+            # Get conversation history from LangChain (automatically limited to last 10 messages)
+            conversation_history = await self.memory_service.format_messages_for_openai(session_id, limit=10)
             
             # Create prompt with context
             system_prompt = """You are TCP (also known as The Collaborative process) RAG Chatbot, a mentor built on The Collaborative Process, a framework that helps teams work better together and cut inefficiencies. You will use the database tool to answer users' questions authentically and engagingly. For each user prompt you will be injected with relevant database context to help formulate a valid response.
@@ -96,23 +108,51 @@ class RAGService:
 
 """
 
-            user_prompt = f"Question: {user_message}"
+            # Prepare messages for OpenAI
+            messages = [{"role": "system", "content": system_prompt.format(context=context)}]
+            
+            # Add conversation history from LangChain (excluding the current user message)
+            for msg in conversation_history[:-1]:  # Exclude the current user message
+                messages.append(msg)
+            
+            # Add current user message
+            messages.append({"role": "user", "content": user_message})
             
             # Generate response using OpenAI
             response = self.openai_client.chat.completions.create(
                 model="gpt-4o-mini",
-                messages=[
-                    {"role": "system", "content": system_prompt.format(context=context)},
-                    {"role": "user", "content": user_prompt}
-                ],
+                messages=messages,
                 max_tokens=max_tokens,
                 temperature=0.7
             )
             
+            assistant_response = response.choices[0].message.content
+            
+            # Add AI response to LangChain memory
+            await self.memory_service.add_ai_message(session_id, assistant_response)
+            
             return {
-                "answer": response.choices[0].message.content,
-                "sources": sources
+                "answer": assistant_response,
+                "sources": sources,
+                "session_id": session_id
             }
             
         except Exception as e:
             raise Exception(f"Error generating RAG response: {str(e)}")
+    
+    async def get_conversation_history(self, session_id: str, limit: int = 10) -> List[Dict]:
+        """Get conversation history for a session"""
+        return await self.memory_service.get_conversation_history(session_id, limit)
+    
+    async def create_new_session(self) -> str:
+        """Create a new chat session"""
+        return self.memory_service.create_session_id()
+    
+    async def clear_session(self, session_id: str) -> bool:
+        """Clear memory for a session"""
+        try:
+            await self.memory_service.clear_memory(session_id)
+            return True
+        except Exception as e:
+            print(f"Error clearing session: {str(e)}")
+            return False
