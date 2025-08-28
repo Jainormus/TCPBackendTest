@@ -6,6 +6,18 @@ from typing import List, Dict, Any
 from .langchain_memory import LangChainMemoryService
 from .prompts import *
 
+MAX_MESSAGES = 20
+
+ACRONYM_MAP = {
+    "TCP": "The Collaborative Process",
+}
+
+def expand_acronyms(query: str) -> str:
+    for acronym, full_form in ACRONYM_MAP.items():
+        if acronym.lower() in query.lower():
+            query += f" ({full_form})"
+    return query
+
 class RAGService:
     def __init__(self):
         self.openai_client = openai.OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
@@ -57,8 +69,7 @@ class RAGService:
             await self.memory_service.add_user_message(session_id, user_message)
             
             # Generate embedding for user query
-            query_embedding = await self.get_embedding(user_message)
-            
+            query_embedding = await self.get_embedding(expand_acronyms(user_message))
             # Search for similar documents
             similar_docs = await self.search_similar_documents(query_embedding)
             
@@ -84,10 +95,11 @@ class RAGService:
             messages = [{"role": "system", "content": system_prompt.format(context=context)}]
             
             # Add conversation history from LangChain (excluding the current user message)
-            for msg in conversation_history[:-1]:  # Exclude the current user message
+            for msg in conversation_history[-MAX_MESSAGES-1:-1]:
                 messages.append(msg)
             
             # Add current user message
+            user_message = f"""<current_user_message> {user_message} <current_user_message>"""
             messages.append({"role": "user", "content": user_message})
             
             # Generate response using OpenAI
@@ -95,7 +107,7 @@ class RAGService:
                 model="gpt-4o-mini",
                 messages=messages,
                 max_tokens=max_tokens,
-                temperature=0.7
+                temperature=0.67
             )
             
             assistant_response = response.choices[0].message.content
